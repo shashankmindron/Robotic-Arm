@@ -1,0 +1,16 @@
+build/
+install/
+log/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.o
+*.a
+*.dylib
+*.dll
+*.exe
+.vscode/
+.idea/
+*.swp
+*~

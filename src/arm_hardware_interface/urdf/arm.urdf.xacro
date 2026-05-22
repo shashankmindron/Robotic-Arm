@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="five_bar_arm">
+
+  <link name="world"/>
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="0.1 0.1 0.1"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <joint name="world_to_base" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+  </joint>
+
+  <ros2_control name="ArmHardware" type="system">
+    <hardware>
+      <plugin>arm_hardware_interface/ArmHardwareInterface</plugin>
+      <param name="serial_port">/dev/ttyUSB0</param>
+    </hardware>
+    
+    <joint name="joint_a">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+    </joint>
+    
+    <joint name="joint_b">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+    </joint>
+  </ros2_control>
+
+</robot>
