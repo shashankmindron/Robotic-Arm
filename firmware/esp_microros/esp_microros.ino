@@ -1,5 +1,6 @@
 /**
- * ESP32 + DUAL TMC5160 + NEMA17 (5-Bar Linkage Parallel Drive)
+ * ESP32 + DUAL TMC5160 + 57AM23ED V2.0 (5-Bar Linkage Parallel Drive)
+ * Open-loop stepper control.
  * Binary serial protocol with telemetry – both motors controlled.
  */
 
@@ -16,7 +17,7 @@
 
 // ── DRIVER 2 PINOUT (Right / Secondary) ───────────────────────────
 #define EN_2_PIN     14
-#define STEP_2_PIN   25          // Your original pin – no change
+#define STEP_2_PIN   25
 #define DIR_2_PIN    33
 #define CS_2_PIN     17
 
@@ -25,9 +26,11 @@
 #define SW_MISO      19
 #define SW_SCK       18
 
-// ── MOTOR SETTINGS (NEMA 17 JK42HS34-1334BED-01) ─────────────────
+// ── MOTOR SETTINGS (Ruitech 57AM23ED V2.0 – 5 A peak, 1.8°/step) ──
 #define R_SENSE       0.022f
-#define MOTOR_CURRENT 1330       // 1.33 A rated
+#define MOTOR_CURRENT 3500       // 3.5 A RMS – safe starting point for 5 A peak motor
+                                 // Increase to 4000 if torque feels weak under load.
+                                 // Do NOT exceed 4500 with TMC5160 on 0.022 R_SENSE.
 #define MICROSTEPS    16
 
 const float STEPS_PER_REV  = 200.0;
@@ -46,7 +49,7 @@ FastAccelStepper *stepper2 = NULL;
 // ── SETUP ─────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("ESP32 booted");
+  Serial.println("ESP32 booted – 57AM23ED V2.0 open-loop");
 
   // Enable both drivers
   pinMode(EN_1_PIN, OUTPUT);
@@ -56,7 +59,7 @@ void setup() {
 
   // SPI & TMC5160 init
   SPI.begin(SW_SCK, SW_MISO, SW_MOSI);
-  
+
   driver1.begin(); driver1.rms_current(MOTOR_CURRENT); driver1.microsteps(MICROSTEPS); driver1.toff(4);
   driver2.begin(); driver2.rms_current(MOTOR_CURRENT); driver2.microsteps(MICROSTEPS); driver2.toff(4);
 
@@ -106,7 +109,6 @@ void loop() {
       long target_steps_1 = round(target_a * RAD_TO_STEPS);
       long target_steps_2 = round(target_b * RAD_TO_STEPS);
 
-      // Command BOTH motors
       if (stepper1) stepper1->moveTo(target_steps_1);
       if (stepper2) stepper2->moveTo(target_steps_2);
     } else {
@@ -120,7 +122,6 @@ void loop() {
   if (millis() - last_telemetry_time >= 20) {
     last_telemetry_time = millis();
 
-    // Send only if both steppers are valid
     if (stepper1 && stepper2) {
       float current_rad_1 = (float)stepper1->getCurrentPosition() * STEPS_TO_RAD;
       float current_rad_2 = (float)stepper2->getCurrentPosition() * STEPS_TO_RAD;

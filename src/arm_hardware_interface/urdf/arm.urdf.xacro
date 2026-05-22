@@ -40,7 +40,7 @@
   <!-- ros2_control tag (keep your existing hardware plugin) -->
   <ros2_control name="ArmControl" type="system">
     <hardware>
-      <plugin>arm_hardware_interface/ArmHardwareInterface</plugin>
+      <plugin>arm_hardware_interface::ArmHardwareInterface</plugin>
       <param name="serial_port">/dev/ttyUSB0</param>
     </hardware>
     <joint name="joint_a">
