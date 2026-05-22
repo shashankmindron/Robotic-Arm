@@ -1,84 +1,79 @@
 #include "arm_hardware_interface/arm_hardware_interface.hpp"
-#include "hardware_interface/types/hardware_interface_type_values.hpp"
-#include <fcntl.h>     // For open, O_RDWR, etc.
-#include <termios.h>   // For tcgetattr, tcsetattr, cfsetospeed, etc.
-#include <unistd.h>    // For read, write, close
-#include <sys/ioctl.h> // For ioctl, FIONREAD
-#include <cstring>     // For std::memcpy
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
+#include <cstring>
+#include <cmath>
+#include <iostream>
+#include <hardware_interface/types/hardware_interface_type_values.hpp>
 
 namespace arm_hardware_interface
 {
-// Explicitly bring CallbackReturn into this namespace scope
-using hardware_interface::CallbackReturn;
 
-// Global or class member variable for the serial file descriptor
-int serial_fd = -1;
-
-CallbackReturn ArmHardwareInterface::on_init(const hardware_interface::HardwareInfo & info)
+hardware_interface::CallbackReturn ArmHardwareInterface::on_init(
+  const hardware_interface::HardwareInfo & info)
 {
   if (hardware_interface::SystemInterface::on_init(info) != CallbackReturn::SUCCESS) {
     return CallbackReturn::ERROR;
   }
 
-  hw_states_positions_.resize(info_.joints.size(), 0.0);
-  hw_commands_positions_.resize(info_.joints.size(), 0.0);
-
-  std::string port = info_.hardware_parameters.at("serial_port");
-  
-  // Open with O_RDWR and O_NOCTTY
-  // We remove O_NDELAY here if we want to handle blocking properly, 
-  // or keep it if we are using a robust polling loop.
-  serial_fd = open(port.c_str(), O_RDWR | O_NOCTTY); 
-  
-  if (serial_fd == -1) {
-    RCLCPP_ERROR(rclcpp::get_logger("ArmHardwareInterface"), "Failed to open serial port: %s", port.c_str());
+  // Open serial port
+  serial_fd_ = open("/dev/ttyUSB0", O_RDWR | O_NOCTTY | O_SYNC);
+  if (serial_fd_ < 0) {
+    RCLCPP_ERROR(rclcpp::get_logger("ArmHardwareInterface"), "Cannot open /dev/ttyUSB0");
     return CallbackReturn::ERROR;
   }
 
-  // 1. Flush the buffer immediately to clear out stale data
-  tcflush(serial_fd, TCIOFLUSH);
+  // Configure serial port (115200 8N1 raw)
+  struct termios tty;
+  memset(&tty, 0, sizeof(tty));
+  if (tcgetattr(serial_fd_, &tty) != 0) {
+    RCLCPP_ERROR(rclcpp::get_logger("ArmHardwareInterface"), "tcgetattr failed");
+    close(serial_fd_);
+    return CallbackReturn::ERROR;
+  }
+  cfsetospeed(&tty, B115200);
+  cfsetispeed(&tty, B115200);
+  tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;  // 8-bit
+  tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+  tty.c_oflag &= ~OPOST;
+  tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+  tty.c_cflag &= ~(PARENB | PARODD);
+  tty.c_cflag &= ~CSTOPB;
+  tty.c_cc[VMIN] = 0;
+  tty.c_cc[VTIME] = 0;
+  if (tcsetattr(serial_fd_, TCSANOW, &tty) != 0) {
+    RCLCPP_ERROR(rclcpp::get_logger("ArmHardwareInterface"), "tcsetattr failed");
+    close(serial_fd_);
+    return CallbackReturn::ERROR;
+  }
 
-  // 2. Configure Serial Port
-  struct termios options;
-  tcgetattr(serial_fd, &options);
-
-  // This sets 8N1, turns off parity, echo, canonical mode, etc. 
-  // It effectively replaces all those bitwise operations you had.
-  cfmakeraw(&options); 
-
-  // Set Speed
-  cfsetispeed(&options, B115200);
-  cfsetospeed(&options, B115200);
-
-  // Set timeout for read (important for non-blocking read calls)
-  options.c_cc[VMIN] = 0;  // Return immediately if no data
-  options.c_cc[VTIME] = 1; // 0.1s timeout
-
-  tcsetattr(serial_fd, TCSANOW, &options);
-
-  RCLCPP_INFO(rclcpp::get_logger("ArmHardwareInterface"), "Serial Pipeline initialized successfully on %s", port.c_str());
+  // Resize vectors based on joint info
+  hw_commands_.resize(info_.joints.size(), 0.0);
+  hw_states_.resize(info_.joints.size(), 0.0);
 
   return CallbackReturn::SUCCESS;
 }
 
-CallbackReturn ArmHardwareInterface::on_activate(const rclcpp_lifecycle::State & /*previous_state*/)
+hardware_interface::CallbackReturn ArmHardwareInterface::on_activate(
+    const rclcpp_lifecycle::State & /*previous_state*/)
 {
-  RCLCPP_INFO(rclcpp::get_logger("ArmHardwareInterface"), "Activating hardware interface...");
-  return CallbackReturn::SUCCESS;
+    return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-CallbackReturn ArmHardwareInterface::on_deactivate(const rclcpp_lifecycle::State & /*previous_state*/)
+hardware_interface::CallbackReturn ArmHardwareInterface::on_deactivate(
+    const rclcpp_lifecycle::State & /*previous_state*/)
 {
-  RCLCPP_INFO(rclcpp::get_logger("ArmHardwareInterface"), "Deactivating hardware interface...");
-  return CallbackReturn::SUCCESS;
+    return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 std::vector<hardware_interface::StateInterface> ArmHardwareInterface::export_state_interfaces()
 {
   std::vector<hardware_interface::StateInterface> state_interfaces;
   for (size_t i = 0; i < info_.joints.size(); ++i) {
-    state_interfaces.emplace_back(hardware_interface::StateInterface(
-      info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_states_positions_[i]));
+    state_interfaces.emplace_back(
+      hardware_interface::StateInterface(
+        info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_states_[i]));
   }
   return state_interfaces;
 }
@@ -87,67 +82,61 @@ std::vector<hardware_interface::CommandInterface> ArmHardwareInterface::export_c
 {
   std::vector<hardware_interface::CommandInterface> command_interfaces;
   for (size_t i = 0; i < info_.joints.size(); ++i) {
-    command_interfaces.emplace_back(hardware_interface::CommandInterface(
-      info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_commands_positions_[i]));
+    command_interfaces.emplace_back(
+      hardware_interface::CommandInterface(
+        info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_commands_[i]));
   }
   return command_interfaces;
 }
 
-hardware_interface::return_type ArmHardwareInterface::read(const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
+hardware_interface::return_type ArmHardwareInterface::read(
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
-  if (serial_fd == -1) return hardware_interface::return_type::ERROR;
-
-  int available = 0;
-  ioctl(serial_fd, FIONREAD, &available);
-
-  if (available >= 10) {
-    // Read the whole buffer so we don't leave stale data behind
-    uint8_t buffer[128]; 
-    int n = ::read(serial_fd, buffer, std::min(available, (int)sizeof(buffer)));
-
-    // Scan through the buffer to find the LATEST valid packet
-    // (We iterate backwards or forward to find the most recent 0xCC)
-    for (int i = 0; i <= n - 10; i++) {
-      if (buffer[i] == 0xCC && buffer[i + 9] == 0xDD) {
-        float fb_a, fb_b;
-        std::memcpy(&fb_a, &buffer[i + 1], 4);
-        std::memcpy(&fb_b, &buffer[i + 5], 4);
-
-        hw_states_positions_[0] = static_cast<double>(fb_a);
-        hw_states_positions_[1] = static_cast<double>(fb_b);
-        
-        // We found a packet, we can break or continue to find a newer one
-      }
-    }
+  // Read all available bytes from serial and parse packets
+  uint8_t temp[256];
+  ssize_t n = ::read(serial_fd_, temp, sizeof(temp));
+  if (n <= 0) {
+    return hardware_interface::return_type::OK;
   }
 
+  for (ssize_t i = 0; i < n; ++i) {
+    // Wait for start marker
+    if (temp[i] == 0xCC) {
+      // We need 10 bytes: 0xCC + 8 payload + 0xDD
+      if (i + 9 < n) {
+        // Check end marker
+        if (temp[i + 9] == 0xDD) {
+          float pos_a, pos_b;
+          memcpy(&pos_a, &temp[i + 1], sizeof(float));
+          memcpy(&pos_b, &temp[i + 5], sizeof(float));
+          hw_states_[0] = pos_a;
+          hw_states_[1] = pos_b;
+          return hardware_interface::return_type::OK;
+        }
+      }
+      // If we don't have enough bytes in this chunk, ignore and wait for next read
+      // (Incomplete packet will be lost, but next complete one will be used)
+    }
+  }
   return hardware_interface::return_type::OK;
 }
 
-hardware_interface::return_type ArmHardwareInterface::write(const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
+hardware_interface::return_type ArmHardwareInterface::write(
+  const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/)
 {
-  if (serial_fd == -1) return hardware_interface::return_type::ERROR;
+  // Build command packet: 0xAA + float joint_a + float joint_b + 0xBB
+  uint8_t packet[10];
+  packet[0] = 0xAA;
+  memcpy(&packet[1], &hw_commands_[0], sizeof(float));  // joint_a
+  memcpy(&packet[5], &hw_commands_[1], sizeof(float));  // joint_b
+  packet[9] = 0xBB;
 
-  uint8_t tx_buffer[10];
-  tx_buffer[0] = 0xAA; // Start marker
-  
-  float cmd_a = static_cast<float>(hw_commands_positions_[0]);
-
-  RCLCPP_INFO(rclcpp::get_logger("ArmHardwareInterface"), "Writing Command: %f to serial", cmd_a);
-
-  float cmd_b = static_cast<float>(hw_commands_positions_[1]);
-  
-  std::memcpy(&tx_buffer[1], &cmd_a, 4);
-  std::memcpy(&tx_buffer[5], &cmd_b, 4);
-  tx_buffer[9] = 0xBB; // End marker
-
-  // Non-blocking write
-  ::write(serial_fd, tx_buffer, 10);
-
+  ::write(serial_fd_, packet, 10);
   return hardware_interface::return_type::OK;
 }
 
-} // namespace arm_hardware_interface
+}  // namespace arm_hardware_interface
 
 #include "pluginlib/class_list_macros.hpp"
-PLUGINLIB_EXPORT_CLASS(arm_hardware_interface::ArmHardwareInterface, hardware_interface::SystemInterface)
+PLUGINLIB_EXPORT_CLASS(
+  arm_hardware_interface::ArmHardwareInterface, hardware_interface::SystemInterface)

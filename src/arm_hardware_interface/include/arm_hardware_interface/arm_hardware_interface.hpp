@@ -28,8 +28,9 @@ public:
   hardware_interface::return_type write(const rclcpp::Time & time, const rclcpp::Duration & period) override;
 
 private:
-  std::vector<double> hw_commands_positions_;
-  std::vector<double> hw_states_positions_;
+  std::vector<double> hw_commands_;
+  std::vector<double> hw_states_;
+  int serial_fd_;
 };
 }  // namespace arm_hardware_interface
 

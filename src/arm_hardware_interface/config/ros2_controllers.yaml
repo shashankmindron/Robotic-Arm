@@ -1,14 +1,14 @@
 controller_manager:
   ros__parameters:
-    update_rate: 50  # Hz
+    update_rate: 50   # Hz, matches your telemetry rate
 
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
-    arm_position_controller:
+    position_controller:
       type: position_controllers/JointGroupPositionController
 
-arm_position_controller:
+position_controller:
   ros__parameters:
     joints:
       - joint_a

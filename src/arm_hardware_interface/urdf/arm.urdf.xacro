@@ -1,35 +1,55 @@
 <?xml version="1.0"?>
-<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="five_bar_arm">
+<robot name="arm" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!-- Ground link -->
+  <link name="base_link" />
 
-  <link name="world"/>
-  <link name="base_link">
-    <visual>
-      <geometry>
-        <box size="0.1 0.1 0.1"/>
-      </geometry>
-    </visual>
-  </link>
-
-  <joint name="world_to_base" type="fixed">
-    <parent link="world"/>
-    <child link="base_link"/>
+  <!-- Motor joints (driven) -->
+  <joint name="joint_a" type="revolute">
+    <parent link="base_link"/>
+    <child link="link_a"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="1" velocity="1"/>
   </joint>
 
-  <ros2_control name="ArmHardware" type="system">
+  <joint name="joint_b" type="revolute">
+    <parent link="base_link"/>
+    <child link="link_b"/>
+    <origin xyz="0.1 0 0" rpy="0 0 0"/>  <!-- separation distance d -->
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.14" upper="3.14" effort="1" velocity="1"/>
+  </joint>
+
+  <link name="link_a">
+    <inertial>
+      <mass value="0.1"/>
+      <origin xyz="0 0 0"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+  <link name="link_b">
+    <inertial>
+      <mass value="0.1"/>
+      <origin xyz="0 0 0"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <!-- Passive links (for completeness) -->
+
+  <!-- ros2_control tag (keep your existing hardware plugin) -->
+  <ros2_control name="ArmControl" type="system">
     <hardware>
       <plugin>arm_hardware_interface/ArmHardwareInterface</plugin>
       <param name="serial_port">/dev/ttyUSB0</param>
     </hardware>
-    
     <joint name="joint_a">
       <command_interface name="position"/>
       <state_interface name="position"/>
     </joint>
-    
     <joint name="joint_b">
       <command_interface name="position"/>
       <state_interface name="position"/>
     </joint>
   </ros2_control>
-
 </robot>

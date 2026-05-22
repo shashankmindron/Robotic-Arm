@@ -3,12 +3,12 @@ import rclpy
 from rclpy.node import Node
 import numpy as np
 from geometry_msgs.msg import Point
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float64MultiArray   # Changed to Float64MultiArray for ros2_control
 
 class RobotArmIKNode(Node):
     def __init__(self):
         super().__init__('robot_arm_ik')
-        
+
         # ----------------------------------------------------------------------
         # HARDWARE LINK CONFIGURATION (Update these with your finalized CAD values)
         # ----------------------------------------------------------------------
@@ -23,11 +23,15 @@ class RobotArmIKNode(Node):
         self.motor_b_x = self.d / 2.0
         self.motor_y = 0.0
 
+        # Declare and read the command topic parameter (default matches typical JointGroupPositionController)
+        self.declare_parameter('command_topic', '/position_controller/commands')
+        command_topic = self.get_parameter('command_topic').get_parameter_value().string_value
+
         # Subscriptions and Publications
         self.pose_sub = self.create_subscription(Point, '/target_pose', self.pose_callback, 10)
-        self.joint_pub = self.create_publisher(Float32MultiArray, '/joint_targets', 10) 
+        self.joint_pub = self.create_publisher(Float64MultiArray, command_topic, 10)
 
-        self.get_logger().info("Parallel 5-Bar Linkage IK Node initialized and ready.")
+        self.get_logger().info(f"Parallel 5-Bar Linkage IK Node initialized. Publishing to {command_topic}")
 
     def ik_5bar(self, x, y):
         """
@@ -50,7 +54,7 @@ class RobotArmIKNode(Node):
 
         # Base angle from motor A to end-effector position
         base_angle_a = np.arctan2(dy_a, dx_a)
-        
+
         # Elbow-up/outer assembly configuration choice (+)
         theta_a = base_angle_a + alpha_a
 
@@ -68,7 +72,7 @@ class RobotArmIKNode(Node):
         alpha_b = np.arccos(cos_alpha_b)
 
         base_angle_b = np.arctan2(dy_b, dx_b)
-        
+
         # Elbow-up/outer assembly configuration choice (-)
         theta_b = base_angle_b - alpha_b
 
@@ -81,17 +85,17 @@ class RobotArmIKNode(Node):
     def pose_callback(self, msg):
         target_x = msg.x
         target_y = msg.y
-        
+
         angles = self.ik_5bar(target_x, target_y)
-        
+
         if angles is None:
             self.get_logger().warn(f"Target position ({target_x}, {target_y}) out of reachable workspace!")
             return
 
         theta_a, theta_b = angles
 
-        # Assemble the standard JointState payload matching Interface Contract
-        msg_out = Float32MultiArray()
+        # Assemble the command message as Float64MultiArray for ros2_control
+        msg_out = Float64MultiArray()
         msg_out.data = [float(theta_a), float(theta_b)]
 
         self.joint_pub.publish(msg_out)
@@ -111,4 +115,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
