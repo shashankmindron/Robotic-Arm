@@ -51,6 +51,14 @@ def generate_launch_description():
         output='screen'
     )
 
+    ik_node = Node(
+        package='robot_arm_ik',
+        executable='ik_node',
+        output='screen',
+        parameters=[{'y_offset_mm': 578.10}]   # change this number to recalibrate
+    )
+
+
     delayed_spawner_joint_state = TimerAction(
         period=3.0,
         actions=[spawner_joint_state]
@@ -60,9 +68,16 @@ def generate_launch_description():
         actions=[spawner_position]
     )
 
+
+    delayed_ik_node = TimerAction(
+        period=6.0,        # starts after position_controller is confirmed active
+        actions=[ik_node]
+    )
+
     return LaunchDescription([
         robot_state_publisher,
         control_node,
         delayed_spawner_joint_state,
         delayed_spawner_position,
+        delayed_ik_node,         
     ])

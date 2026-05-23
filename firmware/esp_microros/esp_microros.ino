@@ -106,8 +106,10 @@ void loop() {
       memcpy(&target_a, &payload[0], 4);
       memcpy(&target_b, &payload[4], 4);
 
+      Serial.printf("CMD: a=%.3f rad  b=%.3f rad\n", target_a, target_b);
+
       long target_steps_1 = round(target_a * RAD_TO_STEPS);
-      long target_steps_2 = round(target_b * RAD_TO_STEPS);
+      long target_steps_2 = round(target_b * RAD_TO_STEPS*-1);
 
       if (stepper1) stepper1->moveTo(target_steps_1);
       if (stepper2) stepper2->moveTo(target_steps_2);
