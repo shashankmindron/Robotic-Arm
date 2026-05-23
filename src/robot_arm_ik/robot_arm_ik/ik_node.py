@@ -72,7 +72,8 @@ class RobotArmIKNode(Node):
         return theta_a, theta_b
 
     def pose_callback(self, msg):
-        angles = self.ik_5bar(msg.x, msg.y)
+        y=msg.y-578.10
+        angles = self.ik_5bar(msg.x, y)
 
         if angles is None:
             self.get_logger().warn(
