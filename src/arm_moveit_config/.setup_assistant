@@ -1,0 +1,10 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: arm_hardware_interface
+    relative_path: urdf/arm.urdf.xacro
+  srdf:
+    relative_path: config/arm.srdf
+  package_settings:
+    author_name: Shashank Vijavargia
+    author_email: mechashank@gmail.com
+    generated_timestamp: 1779970962

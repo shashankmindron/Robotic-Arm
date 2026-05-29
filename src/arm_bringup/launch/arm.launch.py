@@ -3,18 +3,26 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import TimerAction
 from launch_ros.actions import Node
-from launch.substitutions import Command
-from launch.substitutions import PathJoinSubstitution
+from launch.substitutions import Command, PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
+from launch_ros.parameter_descriptions import ParameterValue   # <-- the fix
+
 
 def generate_launch_description():
+
     urdf_file = PathJoinSubstitution([
         FindPackageShare('arm_hardware_interface'),
         'urdf',
         'arm.urdf.xacro'
     ])
 
-    robot_description_content = Command(['xacro ', urdf_file])
+    # Wrap in ParameterValue(..., value_type=str) so ROS 2 treats the
+    # xacro output as a plain string, not YAML.
+    robot_description_content = ParameterValue(
+        Command(['xacro ', urdf_file]),
+        value_type=str
+    )
+
     robot_description = {'robot_description': robot_description_content}
 
     controller_params = PathJoinSubstitution([
@@ -55,9 +63,8 @@ def generate_launch_description():
         package='robot_arm_ik',
         executable='ik_node',
         output='screen',
-        parameters=[{'y_offset_mm': 578.10}]   # change this number to recalibrate
+        parameters=[{'y_offset_mm': 578.10}]
     )
-
 
     delayed_spawner_joint_state = TimerAction(
         period=3.0,
@@ -67,10 +74,8 @@ def generate_launch_description():
         period=4.0,
         actions=[spawner_position]
     )
-
-
     delayed_ik_node = TimerAction(
-        period=6.0,        # starts after position_controller is confirmed active
+        period=6.0,
         actions=[ik_node]
     )
 
@@ -79,5 +84,5 @@ def generate_launch_description():
         control_node,
         delayed_spawner_joint_state,
         delayed_spawner_position,
-        delayed_ik_node,         
+        delayed_ik_node,
     ])
