@@ -14,44 +14,18 @@ from geometry_msgs.msg import Point
 from std_msgs.msg import Float64MultiArray
 from sensor_msgs.msg import JointState
 from moveit_msgs.msg import DisplayRobotState
-from moveit_msgs.srv import GetStateValidity
 
 # Import your custom mathematical brains
-from five_bar_kinematics import FiveBarKinematics
-from trajectory_planner import TrajectoryPlanner
-
-class CollisionGuard:
-    """A helper class to bridge the Trajectory Planner and the ROS 2 MoveIt Service"""
-    def __init__(self, node_reference):
-        self.node = node_reference
-        
-    def check_collision(self, joint_angles):
-        req = GetStateValidity.Request()
-        req.group_name = "arm_group"
-        
-        js = JointState()
-        js.name = ['joint_a', 'joint_b', 'joint_distal_a', 'joint_distal_b']
-        js.position = [float(joint_angles[0]), float(joint_angles[1]), 
-                       float(joint_angles[2]), float(joint_angles[3])]
-        req.robot_state.joint_state = js
-        
-        # Synchronous call (Safe here because we use a MultiThreadedExecutor)
-        future = self.node.cli.call(req)
-        return future.valid
-
+from robot_arm_ik.five_bar_kinematics import FiveBarKinematics
+from robot_arm_ik.astar_planner import AStarPlanner
 
 class RobotArmIKNode(Node):
-    def __init__(self):
+    def __init__(self, planner_node):
         super().__init__('robot_arm_ik')
 
-        # --- ROS 2 Multi-Threading Setup (Prevents MoveIt from freezing) ---
-        self.service_cb_group = MutuallyExclusiveCallbackGroup()
+        # --- ROS 2 Multi-Threading Setup ---
         self.sub_cb_group = MutuallyExclusiveCallbackGroup()
-
-        # --- MoveIt Collision Client ---
-        self.cli = self.create_client(GetStateValidity, '/check_state_validity', callback_group=self.service_cb_group)
-        while not self.cli.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Waiting for MoveIt Collision Service...')
+        self.timer_cb_group = MutuallyExclusiveCallbackGroup()
 
         # --- Hardware Communication (UART) ---
         self.declare_parameter('serial_port', '/dev/ttyUSB0')
@@ -63,32 +37,35 @@ class RobotArmIKNode(Node):
             self.esp32 = serial.Serial(port, baud, timeout=1)
             self.get_logger().info(f"Connected to ESP32 on {port} at {baud} baud.")
         except Exception as e:
-            self.get_logger().error(f"Failed to open UART: {e}. Running in Simulation-Only mode!")
+            self.get_logger().warn(f"Failed to open UART: {e}. Running in Simulation-Only mode!")
             self.esp32 = None
 
         # --- Initialize the Brains ---
         self.kinematics = FiveBarKinematics()
-        self.guard = CollisionGuard(self)
-        self.planner = TrajectoryPlanner(self.kinematics, self.guard)
+        self.planner = planner_node 
 
         # --- Physical State Memory ---
-        # 1. Initialize coordinate targets at the 90-degree resting pose
         self.current_x = 0.0
         self.current_y = 431.25 
-        
-        # FIX: Dynamically solve the initial full 4-angle tuple to prevent index errors
         self.current_geo_angles = None
+        self.current_branch = None 
+        
         home_solutions = self.kinematics.ik_5bar(self.current_x, self.current_y)
         if home_solutions:
             for name, angles in home_solutions.items():
-                # Track the specific assembly branch where proximal arms point straight up (90 deg / 1.57 rad)
                 if math.isclose(angles[0], math.pi/2.0, abs_tol=0.1) and math.isclose(angles[1], math.pi/2.0, abs_tol=0.1):
                     self.current_geo_angles = angles
+                    self.current_branch = name
                     break
         
-        # Hard fallback to full 4-element tuple if the solver isn't active on the first cycle
         if self.current_geo_angles is None:
             self.current_geo_angles = (math.pi / 2.0, math.pi / 2.0, -0.6478, 0.6478)
+            self.current_branch = 'out_out'
+
+        # --- FIXED-RATE EXECUTION QUEUE (THE VELOCITY FIX) ---
+        self.execution_queue = []
+        # Background timer fires precisely every 10ms (100Hz)
+        self.exec_timer = self.create_timer(0.01, self.execution_timer_callback, callback_group=self.timer_cb_group)
 
         # --- ROS 2 Publishers & Subscribers ---
         self.declare_parameter('command_topic', '/position_controller/commands')
@@ -96,132 +73,190 @@ class RobotArmIKNode(Node):
 
         self.pose_sub = self.create_subscription(Point, '/target_pose', self.pose_callback, 10, callback_group=self.sub_cb_group)
         self.joint_pub = self.create_publisher(Float64MultiArray, command_topic, 10)
-        
-        # Publisher to animate the robot in RViz
         self.display_pub = self.create_publisher(DisplayRobotState, '/display_robot_state', 10)
 
-        self.get_logger().info("Central Nervous System Online. Ready to receive draw commands.")
+        self.get_logger().info(f"Autonomous Nervous System Online. Layer: '{self.current_branch}'")
         
-        # --- Spawn Ghost Robot Heartbeat ---
         self.is_idle = True 
         self.startup_timer = self.create_timer(2.0, self.spawn_initial_robot, callback_group=self.sub_cb_group)
 
     def publish_rviz(self, geo_angles):
-        """A clean helper function to update the RViz ghost robot"""
         drs = DisplayRobotState()
         js = JointState()
         js.name = ['joint_a', 'joint_b', 'joint_distal_a', 'joint_distal_b']
-        
-        js.position = [
-            float(geo_angles[0]), 
-            float(geo_angles[1]), 
-            float(geo_angles[2]), 
-            float(geo_angles[3])
-        ]
-        
+        js.position = [float(geo_angles[0]), float(geo_angles[1]), float(geo_angles[2]), float(geo_angles[3])]
         drs.state.joint_state = js
         self.display_pub.publish(drs)
 
     def spawn_initial_robot(self):
-        """Pings the 90-degree home position to RViz until a real command is received."""
         if not self.is_idle:
-            self.startup_timer.cancel() # Stop pulsing once we start drawing
+            self.startup_timer.cancel()
             return
-            
         self.publish_rviz(self.current_geo_angles)
 
-    def pose_callback(self, msg):
-        self.is_idle = False # Instantly shuts off the heartbeat timer
+    def execution_timer_callback(self):
+        """Pure deterministic clock. Pops exactly one 10ms frame per tick!"""
+        if not self.execution_queue:
+            return
+
+        cmd = self.execution_queue.pop(0)
         
+        # Stream UART packet to physical drivers
+        if self.esp32 is not None:
+            packet = struct.pack('<BffffB', 0xAA, cmd['motor_a'], cmd['motor_b'], cmd['hz_a'], cmd['hz_b'], 0xBB)
+            self.esp32.write(packet)
+            
+        # Update RViz UI and joint tracking
+        msg_out = Float64MultiArray()
+        msg_out.data = [float(cmd['motor_a']), float(cmd['motor_b'])]
+        self.joint_pub.publish(msg_out)
+        self.publish_rviz(cmd['geo_angles'])
+        
+        if not self.execution_queue:
+            self.get_logger().info("--- Route Complete! Constant Velocity Maintained. ---")
+
+    def pose_callback(self, msg):
+        self.is_idle = False
         target_x = msg.x
         target_y = msg.y 
         
-        self.get_logger().info(f"--- NEW COMMAND: Drawing to Machine(X:{target_x:.1f}, Y:{target_y:.1f}) ---")
-
-        # Generate Geometry (1mm breadcrumbs)
-        waypoints = self.planner.generate_straight_line(
-            self.current_x, self.current_y, 
-            target_x, target_y, 
-            step_mm=1.0
+        self.get_logger().info(f"\n[PLANNER] Received Target (X:{target_x:.1f}, Y:{target_y:.1f})")
+        
+        trajectory = self.planner.plan_trajectory(
+            self.current_x, self.current_y, self.current_branch, target_x, target_y
         )
         
-        # Generate Physics (Trapezoidal Velocity)
-        total_dist = math.hypot(target_x - self.current_x, target_y - self.current_y)
-        
-        # [TUNE THESE VALUES FOR YOUR HARDWARE]
-        v_max = 100.0  # mm/s (Cruising speed)
-        accel = 500.0  # mm/s^2 (Ramp up)
-        decel = 500.0  # mm/s^2 (Ramp down)
-        
-        speeds = self.planner.generate_velocity_profile(total_dist, 1.0, v_max, accel, decel)
+        if not trajectory:
+            self.get_logger().error("Execution Aborted: No safe route found.")
+            return
 
-        # The Real-Time Execution Loop
-        for i in range(1, len(waypoints)):
-            wx, wy = waypoints[i]
-            v_cartesian = speeds[i]
+        self.get_logger().info("Compiling deterministic 100Hz execution queue...")
+        v_max = 150.0  # Constant Cartesian Speed (mm/s)
+        pulses_per_rad = 4000.0 / (2.0 * math.pi)
+
+        for step in trajectory:
             
-            # --- A. Inverse Kinematics & MoveIt Collision Guard ---
-            next_geo_angles, branch = self.planner.select_best_branch(self.current_geo_angles, wx, wy)
-            
-            if next_geo_angles is None:
-                self.get_logger().error(f"ABORTING TRAJECTORY: Collision detected at X:{wx:.1f}, Y:{wy:.1f}")
-                return # Halt the entire movement instantly
+            # --- FIXED TIME INTERPOLATION FOR DRAGGING LINES ---
+            if step['action'] == 'ik_move':
+                wx = step['target']['x']
+                wy = step['target']['y']
+                branch = step['locked_branch']
                 
-            # --- B. Finite Difference Velocity Math ---
-            dt = 1.0 / v_cartesian # Time = Distance (1mm) / Speed
-            
-            delta_a = next_geo_angles[0] - self.current_geo_angles[0]
-            delta_b = next_geo_angles[1] - self.current_geo_angles[1]
-            
-            omega_a = delta_a / dt
-            omega_b = delta_b / dt
-            
-            # Convert Radians/sec to Pulses/sec (Hz) for the T60S
-            pulses_per_rad = 4000.0 / (2.0 * math.pi)
-            hz_a = abs(omega_a * pulses_per_rad)
-            hz_b = abs(omega_b * pulses_per_rad)
-            
-            # --- C. Hardware Angle Offsets ---
-            motor_a = next_geo_angles[0] - (math.pi / 2.0)
-            motor_b = next_geo_angles[1] - (math.pi / 2.0)
-
-            # --- D. UART Formatting ---
-            packet = struct.pack('<BffffB', 0xAA, motor_a, motor_b, hz_a, hz_b, 0xBB)
-            
-            # Send to ESP32
-            if self.esp32 is not None:
-                self.esp32.write(packet)
+                step_dist = math.hypot(wx - self.current_x, wy - self.current_y)
                 
-            # Publish to ROS 2 (For rqt_plot tracking)
-            msg_out = Float64MultiArray()
-            msg_out.data = [float(motor_a), float(motor_b)]
-            self.joint_pub.publish(msg_out)
+                # Skip if we are already sitting on this coordinate
+                if step_dist < 0.1:
+                    continue
+                
+                # Calculate exactly how many seconds this line segment takes to execute
+                segment_duration = step_dist / v_max
+                # Force it to line up with an integer count of 10ms timer ticks
+                num_ticks = max(1, int(segment_duration / 0.01))
+                
+                start_x = self.current_x
+                start_y = self.current_y
+                
+                for tick in range(1, num_ticks + 1):
+                    t = tick / num_ticks
+                    micro_x = start_x + t * (wx - start_x)
+                    micro_y = start_y + t * (wy - start_y)
+                    
+                    next_geo_angles = self.kinematics.ik_5bar(micro_x, micro_y, filter_singularities=False)[branch]
+                    
+                    # Calculate motor velocity over the exact fixed 0.01s clock tick
+                    omega_a = (next_geo_angles[0] - self.current_geo_angles[0]) / 0.01
+                    omega_b = (next_geo_angles[1] - self.current_geo_angles[1]) / 0.01
+                    
+                    hz_a = abs(omega_a * pulses_per_rad)
+                    hz_b = abs(omega_b * pulses_per_rad)
+                    
+                    motor_a = next_geo_angles[0] - (math.pi / 2.0)
+                    motor_b = next_geo_angles[1] - (math.pi / 2.0)
 
-            # --- E. RViz Visualization (The Ghost Robot) ---
-            self.publish_rviz(next_geo_angles)
+                    # Append frame. dt is implicitly 0.01s everywhere!
+                    self.execution_queue.append({
+                        'motor_a': motor_a, 'motor_b': motor_b,
+                        'hz_a': hz_a, 'hz_b': hz_b,
+                        'geo_angles': next_geo_angles
+                    })
 
-            # --- F. State Update & Pacing ---
-            self.current_x = wx
-            self.current_y = wy
-            self.current_geo_angles = next_geo_angles
-            
-            time.sleep(dt)
+                    self.current_x = micro_x
+                    self.current_y = micro_y
+                    self.current_geo_angles = next_geo_angles
+                    
+                self.current_branch = branch
+                
+            # --- FIXED TIME INTERPOLATION FOR PORTAL FLIPS ---
+            elif step['action'] == 'fk_portal_flip':
+                new_branch = step['new_branch']
+                motor_to_pulse = step['motor_to_pulse']
+                
+                target_geo_angles = self.kinematics.ik_5bar(self.current_x, self.current_y, filter_singularities=False)[new_branch]
+                start_angles = self.current_geo_angles
+                
+                flip_duration = 1.0  # 1 full second for physical flip execution
+                flip_steps = 100     # 100 frames * 10ms = 1.0 second perfectly matching the clock!
+                
+                omega_a = (target_geo_angles[0] - start_angles[0]) / flip_duration
+                omega_b = (target_geo_angles[1] - start_angles[1]) / flip_duration
+                
+                hz_a = abs(omega_a * pulses_per_rad)
+                hz_b = abs(omega_b * pulses_per_rad)
 
-        self.get_logger().info(f"Arrived safely at (X:{self.current_x:.1f}, Y:{self.current_y:.1f})")
+                for frame in range(1, flip_steps + 1):
+                    t = frame / flip_steps
+                    
+                    interp_a = start_angles[0] + t * (target_geo_angles[0] - start_angles[0])
+                    interp_b = start_angles[1] + t * (target_geo_angles[1] - start_angles[1])
+                    
+                    elbow_a_x = self.kinematics.motor_a_x + self.kinematics.l1 * math.cos(interp_a)
+                    elbow_a_y = self.kinematics.motor_y   + self.kinematics.l1 * math.sin(interp_a)
+                    elbow_b_x = self.kinematics.motor_b_x + self.kinematics.l2 * math.cos(interp_b)
+                    elbow_b_y = self.kinematics.motor_y   + self.kinematics.l2 * math.sin(interp_b)
+                    
+                    abs_da = math.atan2(self.current_y - elbow_a_y, self.current_x - elbow_a_x)
+                    abs_db = math.atan2(self.current_y - elbow_b_y, self.current_x - elbow_b_x)
+                    
+                    distal_a = math.atan2(math.sin(abs_da - interp_a), math.cos(abs_da - interp_a))
+                    distal_b = math.atan2(math.sin(abs_db - interp_b), math.cos(abs_db - interp_b))
+                    
+                    interp_angles = (interp_a, interp_b, distal_a, distal_b)
+                    
+                    motor_a = interp_a - (math.pi / 2.0)
+                    motor_b = interp_b - (math.pi / 2.0)
+
+                    self.execution_queue.append({
+                        'motor_a': motor_a, 'motor_b': motor_b,
+                        'hz_a': max(hz_a, 10.0), 'hz_b': max(hz_b, 10.0),
+                        'geo_angles': interp_angles
+                    })
+
+                self.current_geo_angles = target_geo_angles
+                self.current_branch = new_branch
+                
+        self.get_logger().info(f"Buffered {len(self.execution_queue)} synchronized frames. Executing...")
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = RobotArmIKNode()
+    
+    print("Initializing A* Core...")
+    planner_node = AStarPlanner(step_size=15.0) 
+    
+    print("Initializing Hardware IK Node...")
+    ik_node = RobotArmIKNode(planner_node)
+    
     executor = MultiThreadedExecutor()
-    executor.add_node(node)
+    executor.add_node(planner_node)
+    executor.add_node(ik_node)
     
     try:
         executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        ik_node.destroy_node()
+        planner_node.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
