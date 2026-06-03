@@ -1,140 +1,202 @@
-/**
- * ESP32 + DUAL TMC5160 + 57AM23ED V2.0 (5-Bar Linkage Parallel Drive)
- * Open-loop stepper control.
- * Binary serial protocol with telemetry – both motors controlled.
- */
-
 #include <Arduino.h>
-#include <TMCStepper.h>
-#include <SPI.h>
 #include <FastAccelStepper.h>
 
-// ── DRIVER 1 PINOUT (Left / Primary) ──────────────────────────────
-#define EN_1_PIN     22
-#define STEP_1_PIN   27
-#define DIR_1_PIN    26
-#define CS_1_PIN     5
+// ==========================================
+// PIN DEFINITIONS (T60 Drivers)
+// ==========================================
+const int PUL_A = 13;
+const int DIR_A = 14;
+const int ENA_A = 27;
+const int ALM_A = 25;
 
-// ── DRIVER 2 PINOUT (Right / Secondary) ───────────────────────────
-#define EN_2_PIN     14
-#define STEP_2_PIN   25
-#define DIR_2_PIN    33
-#define CS_2_PIN     17
+const int PUL_B = 4;
+const int DIR_B = 16;
+const int ENA_B = 18;
+const int ALM_B = 26;
 
-// ── SHARED SPI BUS ─────────────────────────────────────────────────
-#define SW_MOSI      23
-#define SW_MISO      19
-#define SW_SCK       18
-
-// ── MOTOR SETTINGS (Ruitech 57AM23ED V2.0 – 5 A peak, 1.8°/step) ──
-#define R_SENSE       0.022f
-#define MOTOR_CURRENT 3500       // 3.5 A RMS – safe starting point for 5 A peak motor
-                                 // Increase to 4000 if torque feels weak under load.
-                                 // Do NOT exceed 4500 with TMC5160 on 0.022 R_SENSE.
-#define MICROSTEPS    16
-
-const float STEPS_PER_REV  = 200.0;
-const float TOTAL_STEPS    = STEPS_PER_REV * MICROSTEPS;
-const float RAD_TO_STEPS   = TOTAL_STEPS / (2.0 * M_PI);
-const float STEPS_TO_RAD   = (2.0 * M_PI) / TOTAL_STEPS;
-
-// ── GLOBAL OBJECTS ────────────────────────────────────────────────
-TMC5160Stepper driver1(CS_1_PIN, R_SENSE);
-TMC5160Stepper driver2(CS_2_PIN, R_SENSE);
-
+// ==========================================
+// SYSTEM OBJECTS
+// ==========================================
 FastAccelStepperEngine engine = FastAccelStepperEngine();
-FastAccelStepper *stepper1 = NULL;
-FastAccelStepper *stepper2 = NULL;
+FastAccelStepper *stepperA = NULL;
+FastAccelStepper *stepperB = NULL;
 
-// ── SETUP ─────────────────────────────────────────────────────────
+// Protocol Constraints
+const uint8_t RX_HEADER = 0xAA;
+const uint8_t RX_FOOTER = 0xBB;
+const int RX_PACKET_SIZE = 18;
+
+const uint8_t TX_HEADER = 0xCC;
+const uint8_t TX_FOOTER = 0xDD;
+
+uint8_t rx_buffer[RX_PACKET_SIZE];
+int rx_index = 0;
+
+// Struct for Jetson -> ESP32 (Commands)
+#pragma pack(push, 1)
+struct ArmCommand {
+  uint8_t start_byte;
+  float motor_a_rad;
+  float motor_b_rad;
+  float motor_a_hz;
+  float motor_b_hz;
+  uint8_t end_byte;
+};
+#pragma pack(pop)
+
+// Struct for ESP32 -> Jetson (Feedback)
+#pragma pack(push, 1)
+struct ArmFeedback {
+  uint8_t start_byte;
+  uint8_t status_code; // 0 = Normal, 1 = Hardware Alarm
+  float current_a_rad;
+  float current_b_rad;
+  uint8_t end_byte;
+};
+#pragma pack(pop)
+
+ArmFeedback telemetry;
+
+// Alarm Tracking
+unsigned long alarm_trigger_time = 0;
+bool is_in_alarm_state = false;
+const uint8_t ALARM_ACTIVE_STATE = HIGH; // Change to HIGH if T60 uses NO logic
+
+// Telemetry Timing
+unsigned long last_telemetry_time = 0;
+
+void setupSteppers() {
+    engine.init();
+
+    stepperA = engine.stepperConnectToPin(PUL_A);
+    if (stepperA) {
+        stepperA->setDirectionPin(DIR_A);
+        stepperA->setEnablePin(ENA_A);
+        stepperA->setAutoEnable(false); 
+        stepperA->enableOutputs();
+        stepperA->setAcceleration(20000); 
+    }
+
+    stepperB = engine.stepperConnectToPin(PUL_B);
+    if (stepperB) {
+        stepperB->setDirectionPin(DIR_B);
+        stepperB->setEnablePin(ENA_B);
+        stepperB->setAutoEnable(false);
+        stepperB->enableOutputs();
+        stepperB->setAcceleration(20000); 
+    }
+}
+
+void processValidPacket(uint8_t* buffer) {
+    float angleA, angleB, speedA, speedB;
+
+    memcpy(&angleA, &buffer[1], 4);
+    memcpy(&angleB, &buffer[5], 4);
+    memcpy(&speedA, &buffer[9], 4);
+    memcpy(&speedB, &buffer[13], 4);
+
+    const float radToPulse = 3200.0f / TWO_PI;
+    int32_t targetPulsesA = round(angleA * radToPulse);
+    int32_t targetPulsesB = round(angleB * radToPulse);
+
+    uint32_t speedHzA = (uint32_t)abs(speedA);
+    uint32_t speedHzB = (uint32_t)abs(speedB);
+
+    if (speedHzA > 0) stepperA->setSpeedInHz(speedHzA);
+    if (speedHzB > 0) stepperB->setSpeedInHz(speedHzB);
+
+    stepperA->moveTo(targetPulsesA);
+    stepperB->moveTo(targetPulsesB);
+}
+
 void setup() {
-  Serial.begin(115200);
-  Serial.println("ESP32 booted – 57AM23ED V2.0 open-loop");
+    Serial.begin(115200);
+    
+    pinMode(ALM_A, INPUT_PULLUP);
+    pinMode(ALM_B, INPUT_PULLUP);
 
-  // Enable both drivers
-  pinMode(EN_1_PIN, OUTPUT);
-  digitalWrite(EN_1_PIN, LOW);
-  pinMode(EN_2_PIN, OUTPUT);
-  digitalWrite(EN_2_PIN, LOW);
-
-  // SPI & TMC5160 init
-  SPI.begin(SW_SCK, SW_MISO, SW_MOSI);
-
-  driver1.begin(); driver1.rms_current(MOTOR_CURRENT); driver1.microsteps(MICROSTEPS); driver1.toff(4);
-  driver2.begin(); driver2.rms_current(MOTOR_CURRENT); driver2.microsteps(MICROSTEPS); driver2.toff(4);
-
-  // FastAccelStepper engine
-  engine.init();
-
-  // Stepper 1
-  stepper1 = engine.stepperConnectToPin(STEP_1_PIN);
-  if (stepper1) {
-    stepper1->setDirectionPin(DIR_1_PIN);
-    stepper1->setSpeedInHz(1000);
-    stepper1->setAcceleration(500);
-    Serial.println("Stepper1 OK");
-  } else {
-    Serial.println("Stepper1 FAIL");
-  }
-
-  // Stepper 2
-  stepper2 = engine.stepperConnectToPin(STEP_2_PIN);
-  if (stepper2) {
-    stepper2->setDirectionPin(DIR_2_PIN);
-    stepper2->setSpeedInHz(1000);
-    stepper2->setAcceleration(500);
-    Serial.println("Stepper2 OK");
-  } else {
-    Serial.println("Stepper2 FAIL");
-  }
+    setupSteppers();
 }
 
-// ── MAIN LOOP ─────────────────────────────────────────────────────
 void loop() {
-  // ----- 1. RECEIVE COMMAND PACKET (10 bytes: 0xAA + 8 payload + 0xBB) -----
-  while (Serial.available() >= 10) {
-    if (Serial.read() != 0xAA) {
-      continue;
+    // 1. RECEIVE COMMANDS
+    if (!is_in_alarm_state) {
+        while (Serial.available() > 0) {
+            uint8_t incomingByte = Serial.read();
+
+            if (rx_index == 0) {
+                if (incomingByte == RX_HEADER) rx_buffer[rx_index++] = incomingByte;
+            } else {
+                rx_buffer[rx_index++] = incomingByte;
+                if (rx_index == RX_PACKET_SIZE) {
+                    if (rx_buffer[RX_PACKET_SIZE - 1] == RX_FOOTER) {
+                        processValidPacket(rx_buffer); 
+                    } else {
+                        while(Serial.available()) Serial.read(); 
+                    }
+                    rx_index = 0; 
+                }
+            }
+        }
     }
 
-    uint8_t payload[8];
-    Serial.readBytes(payload, 8);
-    uint8_t end_marker = Serial.read();
+    // 2. T60 ALARM CHECK (50ms Anti-Noise Debounce)
+    bool a_fault = false;//(digitalRead(ALM_A) == ALARM_ACTIVE_STATE);
+    bool b_fault = false;//(digitalRead(ALM_B) == ALARM_ACTIVE_STATE);
 
-    if (end_marker == 0xBB) {
-      float target_a, target_b;
-      memcpy(&target_a, &payload[0], 4);
-      memcpy(&target_b, &payload[4], 4);
-
-      Serial.printf("CMD: a=%.3f rad  b=%.3f rad\n", target_a, target_b);
-
-      long target_steps_1 = round(target_a * RAD_TO_STEPS);
-      long target_steps_2 = round(target_b * RAD_TO_STEPS*-1);
-
-      if (stepper1) stepper1->moveTo(target_steps_1);
-      if (stepper2) stepper2->moveTo(target_steps_2);
+    if (a_fault || b_fault) {
+        if (alarm_trigger_time == 0) alarm_trigger_time = millis(); 
+        else if (millis() - alarm_trigger_time > 50) { 
+            if (!is_in_alarm_state) {
+                stepperA->stopMove();
+                stepperB->stopMove();
+                is_in_alarm_state = true;
+            }
+        }
     } else {
-      // Corrupt packet – flush
-      while (Serial.available() > 0) Serial.read();
+        alarm_trigger_time = 0; 
     }
-  }
 
-  // ----- 2. SEND TELEMETRY (50 Hz) ----------------------------------------
-  static unsigned long last_telemetry_time = 0;
-  if (millis() - last_telemetry_time >= 20) {
-    last_telemetry_time = millis();
+    // 3. TRANSMIT TELEMETRY (Every 20ms = 50Hz)
+    if (millis() - last_telemetry_time >= 20) {
+        last_telemetry_time = millis();
 
-    if (stepper1 && stepper2) {
-      float current_rad_1 = (float)stepper1->getCurrentPosition() * STEPS_TO_RAD;
-      float current_rad_2 = (float)stepper2->getCurrentPosition() * STEPS_TO_RAD;
+        telemetry.start_byte = TX_HEADER;
+        telemetry.status_code = is_in_alarm_state ? 1 : 0;
+        
+        // Convert physical pulses back into Radians
+        const float pulseToRad = TWO_PI / 3200.0f;
+        telemetry.current_a_rad = stepperA->getCurrentPosition() * pulseToRad;
+        telemetry.current_b_rad = stepperB->getCurrentPosition() * pulseToRad;
+        
+        telemetry.end_byte = TX_FOOTER;
 
-      uint8_t outbound_packet[10];
-      outbound_packet[0] = 0xCC;
-      memcpy(&outbound_packet[1], &current_rad_1, sizeof(float));
-      memcpy(&outbound_packet[5], &current_rad_2, sizeof(float));
-      outbound_packet[9] = 0xDD;
-
-      Serial.write(outbound_packet, sizeof(outbound_packet));
+        // Blast 11-byte binary packet directly down the USB cable
+        Serial.write((uint8_t*)&telemetry, sizeof(ArmFeedback));
     }
-  }
 }
+
+
+// // Define the pin connection
+// const int dataPin = 15; // GPIO 15 corresponds to D15 on most ESP32 boards
+// int sensorValue = 0;    // Variable to store the data
+
+// void setup() {
+//   // Initialize serial communication at 115200 baud (standard for ESP32)
+//   Serial.begin(250000);
+  
+//   // Configure the data pin as an input
+//   pinMode(dataPin, INPUT);
+// }
+
+// void loop() {
+//   // Read the state of the pin (HIGH or LOW / 1 or 0)
+//   sensorValue = digitalRead(dataPin);
+  
+//   // Print the value to the Serial Monitor
+//   Serial.print("Data from D15: ");
+//   Serial.println(sensorValue);
+  
+//   // Wait for half a second before reading again to avoid flooding the monitor
+//   delay(500); 
+// }
