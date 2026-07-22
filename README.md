@@ -44,13 +44,13 @@ This isn't a simulation-only or tutorial-following project — every layer (mech
                  │  Serial Link (UART  │───────────────────────────►│   ESP32     │
                  │  115200 baud        │◄───────────────────────────│  Firmware   │
                  └─────────────────────┘   11-byte telemetry (50Hz) └──────┬──────┘
-                                                                             │
-                                                                    FastAccelStepper
-                                                                             │
-                                                                   ┌─────────▼─────────┐
-                                                                   │ 2× Stepper Motors │
-                                                                   │ (T60 drivers)     │
-                                                                   └───────────────────┘
+                                                                           │
+                                                                  FastAccelStepper
+                                                                           │
+                                                                 ┌─────────▼─────────┐
+                                                                 │ 2× Stepper Motors │
+                                                                 │ (T60 drivers)     │
+                                                                 └───────────────────┘
 ```
 
 ## Repository Structure
